@@ -21,6 +21,34 @@ max_rays = 100
 prev_model_center_avg = (320,240)
 max_observed_distance = 0  # Initialize adaptive radius
 
+# --- Smoothing and stability globals ---
+smoothed_gaze_dir = None
+
+# Tunables
+gaze_ema_alpha = 0.30
+max_pupil_jump_px = 75
+max_reject_streak_to_force_accept = 4
+
+prev_pupil_center = None
+last_good_ellipse = None
+jump_reject_streak = 0
+
+
+def _ema_vector(prev_vec, new_vec, alpha):
+    if new_vec is None:
+        return prev_vec
+    if prev_vec is None:
+        return new_vec.copy()
+    return (1.0 - alpha) * prev_vec + alpha * new_vec
+
+
+def _is_large_jump(prev_pt, new_pt, max_jump):
+    if prev_pt is None or new_pt is None:
+        return False
+    dx = float(new_pt[0] - prev_pt[0])
+    dy = float(new_pt[1] - prev_pt[1])
+    return (dx * dx + dy * dy) > (max_jump * max_jump)
+
 # Function to detect available cameras
 def detect_cameras(max_cams=10):
     available_cameras = []
@@ -77,7 +105,7 @@ def get_darkest_area(image):
                 for dx in range(0, searchArea, internalSkipSize):
                     if x + dx >= gray.shape[1]:
                         break
-                    current_sum += gray[y + dy][x + dx]
+                    current_sum += int(gray[y + dy][x + dx])
                     num_pixels += 1
 
             if current_sum < min_sum and num_pixels > 0:
@@ -265,30 +293,24 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
     global max_rays
     global prev_model_center_avg
     global max_observed_distance
+    global smoothed_gaze_dir
+    global prev_pupil_center
+    global last_good_ellipse
+    global jump_reject_streak
 
     kernel_size = 5
     kernel = np.ones((kernel_size, kernel_size), np.uint8)
 
-    dilated_image = cv2.dilate(thresholded_image_medium, kernel, iterations=2)
-    contours, _ = cv2.findContours(dilated_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    reduced_contours = filter_contours_by_area_and_return_largest(contours, 1000, 3)
-
-    final_rotated_rect = ((0,0),(0,0),0)
-
     image_array = [thresholded_image_relaxed, thresholded_image_medium, thresholded_image_strict] #holds images
     name_array = ["relaxed", "medium", "strict"] #for naming windows
-    final_image = image_array[0] #holds return array
-    final_contours = [] #holds final contours
-    ellipse_reduced_contours = [] #holds an array of the best contour points from the fitting process
     goodness = 0 #goodness value for best ellipse
-    best_array = 0 
-    kernel_size = 5  # Size of the kernel (5x5)
-    kernel = np.ones((kernel_size, kernel_size), np.uint8)
+    final_rotated_rect = None
+    center_x, center_y = None, None
     gray_copy1 = gray_frame.copy()
     gray_copy2 = gray_frame.copy()
     gray_copy3 = gray_frame.copy()
     gray_copies = [gray_copy1, gray_copy2, gray_copy3]
-    final_goodness = 0
+    final_goodness = 0.0
     
     #iterate through binary images and see which fits the ellipse best
     for i in range(1,4):
@@ -298,51 +320,54 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
         # Find contours
         contours, hierarchy = cv2.findContours(dilated_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        # Create an empty image to draw contours
-        contour_img2 = np.zeros_like(dilated_image)
         reduced_contours = filter_contours_by_area_and_return_largest(contours, 1000, 3)
+        if len(reduced_contours) > 0 and len(reduced_contours[0]) > 8:
+            contour = reduced_contours[0]
+            current_goodness = check_ellipse_goodness(dilated_image, contour, debug_mode_on)
+            ellipse = cv2.fitEllipse(contour)
+            axes = ellipse[1]
+            max_axis = max(axes[0], axes[1], 1.0)
+            min_axis = min(axes[0], axes[1])
+            axis_ratio = float(min_axis / max_axis)
+            if axis_ratio < 0.25:
+                continue
 
-        #initialize variables
-        center_x, center_y = None, None
-
-        if len(reduced_contours) > 0 and len(reduced_contours[0]) > 5:
-            current_goodness = check_ellipse_goodness(dilated_image, reduced_contours[0], debug_mode_on)
-            ellipse = cv2.fitEllipse(reduced_contours[0])
-            center_x, center_y = map(int, ellipse[0]) 
-            if debug_mode_on: #show contours 
+            if debug_mode_on:
                 cv2.imshow(name_array[i-1] + " threshold", gray_copies[i-1])
-                
-            #in total pixels, first element is pixel total, next is ratio
-            total_pixels = check_contour_pixels(reduced_contours[0], dilated_image.shape, debug_mode_on)                 
-            
-            cv2.ellipse(gray_copies[i-1], ellipse, (255, 0, 0), 2)  # Draw with specified color and thickness of 2
-            font = cv2.FONT_HERSHEY_SIMPLEX  # Font type
-            
-            final_goodness = current_goodness[0]*total_pixels[0]*total_pixels[0]*total_pixels[1]
 
-        if final_goodness > 0 and final_goodness > goodness: 
-            goodness = final_goodness
-            ellipse_reduced_contours = total_pixels[2]
-            best_image = image_array[i-1]
-            final_contours = reduced_contours
-            final_image = dilated_image
+            # in total pixels, first element is pixel total, next is ratio
+            total_pixels = check_contour_pixels(contour, dilated_image.shape, debug_mode_on)
+            if len(total_pixels) < 3:
+                continue
+            if total_pixels[1] < 0.18:
+                continue
 
-    test_frame = frame.copy()
-    
-    final_contours = [optimize_contours_by_angle(final_contours, gray_frame)]
-    
-    final_rotated_rect = None
+            # Favor stable edge fit + near-circular pupil shape
+            final_goodness = float(current_goodness[0]) * float(total_pixels[1]) * axis_ratio
 
-    if final_contours and not isinstance(final_contours[0], list) and len(final_contours[0] > 5):
-        ellipse = cv2.fitEllipse(final_contours[0])
-        final_rotated_rect = ellipse
+            if final_goodness > goodness:
+                goodness = final_goodness
+                final_rotated_rect = ellipse
+
+    if final_rotated_rect is not None:
+        candidate_center = tuple(map(int, final_rotated_rect[0]))
+        if _is_large_jump(prev_pupil_center, candidate_center, max_pupil_jump_px) and last_good_ellipse is not None and jump_reject_streak < max_reject_streak_to_force_accept:
+            final_rotated_rect = last_good_ellipse
+            candidate_center = tuple(map(int, final_rotated_rect[0]))
+            jump_reject_streak += 1
+        else:
+            last_good_ellipse = final_rotated_rect
+            jump_reject_streak = 0
+
+        prev_pupil_center = candidate_center
+        center_x, center_y = candidate_center
 
         # Store the new ray in the list
         ray_lines.append(final_rotated_rect)
-        # **Prune rays if list exceeds max_rays**
+        # Prune rays if list exceeds max_rays
         if len(ray_lines) > max_rays:
             num_to_remove = len(ray_lines) - max_rays
-            ray_lines = ray_lines[num_to_remove:]  # Keep only the last `max_rays` elements
+            ray_lines = ray_lines[num_to_remove:]
 
     model_center_average = (320,240)
 
@@ -375,8 +400,7 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
 
     if final_rotated_rect is not None and center_x is not None and center_y is not None:
         cv2.line(frame, model_center_average, (center_x, center_y), (255, 150, 50), 2)  # # Draw line from eye center to ellipse center
-        
-    cv2.ellipse(frame, final_rotated_rect, (20, 255, 255), 2) #draw final ellipse on image
+        cv2.ellipse(frame, final_rotated_rect, (20, 255, 255), 2) #draw final ellipse on image
 
     # Calculate the extended endpoint of gaze line
     if final_rotated_rect is not None and center_x is not None and center_y is not None:
@@ -406,6 +430,8 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
     center, direction = compute_gaze_vector(center_x, center_y, model_center_average[0], model_center_average[1])
 
     if center is not None and direction is not None:
+        smoothed_gaze_dir = _ema_vector(smoothed_gaze_dir, direction, gaze_ema_alpha)
+
         origin_text = f"Origin: ({center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f})"
         dir_text    = f"Direction: ({direction[0]:.2f}, {direction[1]:.2f}, {direction[2]:.2f})"
 
@@ -421,6 +447,7 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
         # Draw text on the frame
         cv2.putText(frame, origin_text, text_origin2, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
         cv2.putText(frame, dir_text, text_dir2, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+    cv2.putText(frame, "q=quit, space=pause", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
 
     if center is not None and direction is not None:
         print(f"Sphere Center:   ({center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f})")
@@ -774,9 +801,12 @@ def process_frame(frame):
 
     #find the darkest point
     darkest_point = get_darkest_area(frame)
+    if darkest_point is None:
+        darkest_point = (frame.shape[1] // 2, frame.shape[0] // 2)
 
     # Convert to grayscale to handle pixel value operations
     gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    gray_frame = cv2.GaussianBlur(gray_frame, (5, 5), 0)
     darkest_pixel_value = gray_frame[darkest_point[1], darkest_point[0]]
     
     # apply thresholding operations at different levels
